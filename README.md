@@ -312,6 +312,105 @@ will spawn a number of threads in order to optimize performance for
 iRODS server versions 4.2.9+ and file sizes larger than a default
 threshold value of 32 Megabytes.
 
+Because multithreaded processes under Unix-type operating systems sometimes
+need special handling, it is recommended that any put or get of a large file
+be appropriately handled in the case that a terminating signal aborts the
+transfer:
+
+```python
+from irods.parallel import abort_parallel_transfers
+
+def handler(signal, _):
+    abort_parallel_transfers()
+
+signal(SIGTERM, handler)
+
+try:
+    # A multi-1247 put or get can leave non-daemon threads running if not treated with care.
+    session.data_objects.put(...)
+except KeyboardInterrupt:
+    # Internally, the library has likely already started a shutdown for the
+    # present put operation, but we can non-destructively issue the following
+    # call to ensure any other ongoing transfers are aborted, prior to re-raising:
+    abort_parallel_transfers()
+
+    printf('Due to a SIGINT or Control-C, the put failed.')
+    # Raise again, as is customary when catching a directly BaseException-derived object.
+    raise
+except RuntimeError:
+    printf('The put failed.')
+# ...
+```
+
+In general it is better (for applications wanting to gracefully handle
+interrupted lengthy data transfers to/from iRODS data objects) to anticipate
+control-C by handling both `KeyboardInterrupt` and `RuntimeError`, as shown
+above.
+
+Of course, had we intercepted SIGINT (meaning we assigned it a custom
+handler), we could avoid the need to handle the `KeyboardInterrupt` in an
+exception clause.
+
+Internally, of course, the PRC must handle all eventualities, including
+`KeyboardInterrupt`, by closing down the current transfer being setup or
+waited on, in consideration of very simple applications which might do no
+signal or exception handling of their own.  Otherwise we would risk some
+non-daemon threads not finishing, which could risk preventing a prompt and
+orderly exit from the main program.
+
+When a signal or exception handler calls `abort_parallel_transfers()`, all
+parallel transfers are aborted immediately. Upon return to the normal flow
+of the main program, the affected transfers will raise `RuntimeError` to
+indicate the PUT or GET operation has failed.
+
+Note that `abort_parallel_transfers()` is designed to be safe for inclusion
+in signal handlers (e.g. it may be called several times without detrimental
+effects); and that it returns promptly after having initiated the process of
+shutting down the data transfer threads, rather than waiting for them to
+terminate first.  This owes to the best practice of minimizing time spent in
+signal handlers.  However, if desired, `abort_parallel_transfers()` may be
+iterated subsequently with `(dry_run=True, ...)` to track the progress of the
+shutdown.  The default object returned (a dictionary whose keys are weak
+references to the thread managers) will have a boolean value of `False` once
+all transfer threads have exited.
+
+The following example shows how to abort all synchronous ("foreground") puts
+while leaving background transfers alone:
+
+```python
+import irods.helpers, threading
+from irods.parallel import abort_parallel_transfers, FILTER_FUNCTIONS, io_main, Oper
+
+session = irods.helpers.make_session()
+hc = irods.helpers.home_collection(session)
+
+sessions_for_threads = [session.clone() for _ in range(3)]
+
+# Launch an asynchronous (i.e. "background") transfer
+io_main(session, '{hc}/target_0', Oper.PUT|Oper.NONBLOCKING, 'my_large_file')
+
+Threads = [ threading.Thread(target=lambda _sess, put_args: _sess.data_objects.put(*put_args, num_threads=2),
+                        args=(sess,["my_large_file", f"{hc}/target_"+str(i+1)]))
+       for i, sess in enumerate(sessions_for_threads) ]
+
+try:
+    # Launch transfer threads
+    for t in Threads:
+        t.start()
+    # Wait on transfer threads
+    for t in Threads:
+        t.join()
+except KeyboardInterrupt:
+    # Trapping control-C, stop transfers launched synchronously, i.e. in the foreground of each transfer thread
+    # explicitly launched above.
+    abort_parallel_transfers(filter_function = FILTER_FUNCTIONS.foreground)
+
+# As the main application continues (or exits), the asynchronous transfer will be the only one to finish
+# successfully after this call to `abort_parallel_transfers`.  Note:  Although care is taken not to
+# leave replicas in a locked state, these relics of unfinished transfers can still remain in the
+# object catalog.
+```
+
 Progress bars
 -------------
 
@@ -831,6 +930,66 @@ of create and modify timestamps for every AVU returned from the server:
 >>> avus[0].create_time
 datetime.datetime(2022, 9, 19, 15, 26, 7)
 ```
+
+Disabling AVU reloads from the iRODS server
+-------------------------------------------
+
+With the default setting of `reload = True`, an `iRODSMetaCollection` will
+proactively read all current AVUs back from the iRODS server after any
+metadata write done by the client.  This helps methods such as `items()`
+to return an up-to-date result.   Setting `reload = False` can, however, greatly
+increase code efficiency if for example a lot of AVUs must be added or deleted
+at once without reading any back again.
+
+```py
+# Make a metadata view in which AVUs are not reloaded, for quick update:
+non_current_metadata_view = obj.metadata(reload = False)
+for i in range(10):
+    non_current_metadata_view.add("my_key", "my_value_"+str(i))
+
+# Force reload of AVUs and display:
+current_metadata = obj.metadata().items()
+print(f"{current_metadata = }")
+```
+
+Subclassing `iRODSMeta`
+---------------------
+The keyword option `iRODSMeta_type` can be used to set up any `iRODSMeta`
+subclass as the translator between native iRODS metadata APIs
+and the way in which the AVUs thus conveyed should be represented to the
+client.
+
+An example is the `irods.meta.iRODSBinOrStringMeta` class which uses the
+`base64` module to "hide" arbitrary bytestrings within the `value` and
+`units` attributes of an iRODS metadata AVU:
+
+```py
+from irods.meta import iRODSBinOrStringMeta as MyMeta
+d = session.data_objects.get('/path/to/object')
+unencodable_octets = '\u1000'.encode('utf8')[:-1]
+
+# Use our custom client-metadata type to store arbitrary octet strings.
+meta_view = d.metadata(iRODSMeta_type = MyMeta)
+meta_view.set(m1 := MyMeta('mybinary', unencodable_octets, b'\x02'))
+
+# Show that traditional AVU's can exist alongside the custom kind.
+irods.client_configuration.connections.xml_parser_default = 'QUASI_XML'
+meta_view.set(m2 := MyMeta('mytext', '\1', '\2'))
+
+try:
+    # These two lines are equivalent.
+    assert {m1,m2} <= (all_avus := set(meta_view.items()))
+    assert {tuple(m1),tuple(m2)} <= all_avus
+finally:
+    del meta_view['mytext'], meta_view['mybinary']
+```
+
+Whereas the content of native iRODS AVUs must obey some valid text encoding as
+determined by the resident iRODS catalog, the above is a possible alternative - albeit
+one semantically bound to the local application that defines the needed
+translations.  Still, this can be a valid usage for users who need a guarantee
+that any given octet string they might generate can be placed into metadata without
+violating standard text encodings.
 
 Atomic operations on metadata
 -----------------------------
